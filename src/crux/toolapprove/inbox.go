@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -477,24 +478,21 @@ func (i *Inbox) Resolve(id string, approved bool, operator, rationale string) (R
 	if idx < 0 {
 		return ResolvedRecord{}, fmt.Errorf("%w: %s", ErrNotFound, id)
 	}
+	// Sweep and prune can overwrite slice elements. Keep the last state intact
+	// so a failed write leaves the approval pending and retryable.
+	previous := i.state
+	i.state.Pending = slices.Clone(previous.Pending)
 	if p := i.state.Pending[idx]; i.expiredLocked(p) {
 		expiredAt := p.QueuedAt.Add(i.ttl).UTC().Format(time.RFC3339)
 		i.sweepLocked()
 		if err := i.persistLocked(); err != nil {
+			i.state = previous
 			return ResolvedRecord{}, fmt.Errorf("%w: %s at %s (sweep: %v)", ErrExpired, id, expiredAt, err)
 		}
 		return ResolvedRecord{}, fmt.Errorf("%w: %s at %s", ErrExpired, id, expiredAt)
 	}
-	// Sweep other expired items now that the queue is being rewritten anyway.
-	// The target survived the check above, so idx is recomputed after.
-	if i.sweepLocked() > 0 {
-		for n, p := range i.state.Pending {
-			if p.ID == id {
-				idx = n
-				break
-			}
-		}
-	}
+	i.state.Pending = slices.Delete(i.state.Pending, idx, idx+1)
+	i.sweepLocked()
 
 	rec := ResolvedRecord{
 		ID:         id,
@@ -503,11 +501,11 @@ func (i *Inbox) Resolve(id string, approved bool, operator, rationale string) (R
 		Rationale:  rationale,
 		ResolvedAt: i.now().UTC(),
 	}
-	i.state.Pending = append(i.state.Pending[:idx], i.state.Pending[idx+1:]...)
-	i.state.Resolved = append(i.state.Resolved, rec)
+	i.state.Resolved = append(slices.Clone(previous.Resolved), rec)
 	i.pruneJournalLocked()
 
 	if err := i.persistLocked(); err != nil {
+		i.state = previous
 		return rec, err
 	}
 	return rec, nil

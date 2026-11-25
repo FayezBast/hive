@@ -9,12 +9,18 @@
     let _approvalsSelected = new Set();
     let _approvalsRuleFilter = null;
     let _approvalsLast = null;
+    let _approvalsFetchSequence = 0;
+    let _approvalsAppliedFetch = 0;
 
     async function fetchApprovals() {
+      const sequence = ++_approvalsFetchSequence;
       try {
         const r = await fetch('/api/approvals');
         if (!r.ok) return;               // 403 for non-owners: leave hidden
-        renderApprovals(await r.json());
+        const dto = await r.json();
+        if (sequence <= _approvalsAppliedFetch) return;
+        _approvalsAppliedFetch = sequence;
+        renderApprovals(dto);
       } catch (e) { /* transient — leave last render in place */ }
     }
 
@@ -56,9 +62,7 @@
         chips.innerHTML = html;
       }
 
-      const shown = _approvalsRuleFilter
-        ? items.filter(i => i.rule === _approvalsRuleFilter)
-        : items;
+      const shown = approvalsFilterByRule(items);
 
       // Drop selections for rows that no longer exist (resolved elsewhere).
       const live = new Set(items.map(i => i.id));
@@ -103,12 +107,25 @@
       '</div>';
     }
 
+    function approvalsFilterByRule(items) {
+      return _approvalsRuleFilter ? items.filter(i => i.rule === _approvalsRuleFilter) : items;
+    }
+
+    function approvalsSelectedForRule() {
+      const ids = Array.from(_approvalsSelected);
+      if (!_approvalsRuleFilter) return ids;
+      const shown = approvalsFilterByRule(_approvalsLast?.items || []);
+      const visible = new Set(shown.map(item => item.id));
+      return ids.filter(id => visible.has(id));
+    }
+
     function updateApprovalsActions() {
       const actions = document.getElementById('approvals-actions');
       const count = document.getElementById('approvals-selected-count');
       if (!actions) return;
-      actions.style.display = _approvalsSelected.size ? 'flex' : 'none';
-      if (count) count.textContent = _approvalsSelected.size + ' selected';
+      const selected = approvalsSelectedForRule().length;
+      actions.style.display = selected ? 'flex' : 'none';
+      if (count) count.textContent = selected + ' selected';
     }
 
     function approvalsSetFilter(rule) {
@@ -138,17 +155,61 @@
     // through the same path the single-item button uses — this is a UI
     // convenience, never a separate decision path.
     async function approvalsResolveSelected(approved) {
-      const ids = Array.from(_approvalsSelected);
+      const ids = approvalsSelectedForRule();
       if (!ids.length) return;
+      const action = approved ? 'approve' : 'reject';
+      const messages = [];
+      const resolved = new Set();
       try {
-        await fetch('/api/approvals/bulk', {
+        const response = await fetch('/api/approvals/bulk', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ ids: ids, approved: approved })
         });
-      } catch (e) { /* surfaced by the refetch below */ }
-      _approvalsSelected.clear();
-      fetchApprovals();
+        const data = await response.json().catch(() => null);
+        if (!response.ok) {
+          const reason = data?.detail || data?.error || 'HTTP ' + response.status;
+          // These rejections are returned before the endpoint attempts any decisions.
+          if (![400, 401, 403, 404].includes(response.status)) throw new Error(reason);
+          messages.push('Bulk ' + action + ' failed for ' + ids.length + ' of ' + ids.length +
+            ' approvals. ' + reason);
+        } else {
+          if (!Array.isArray(data?.results)) throw new Error('Invalid bulk approval response');
+          const results = new Map(data.results.map(result => [result?.id, result]));
+          const failures = [];
+          let unconfirmed = 0;
+
+          for (const id of ids) {
+            const result = results.get(id);
+            if (result?.ok === true) {
+              resolved.add(id);
+              _approvalsSelected.delete(id);
+            } else if (result?.ok === false) {
+              failures.push(id + ': ' + (result.error || 'Resolution failed'));
+            } else {
+              unconfirmed++;
+            }
+          }
+          if (failures.length) {
+            const more = failures.length > 3 ? ' (+' + (failures.length - 3) + ' more)' : '';
+            messages.push('Bulk ' + action + ' failed for ' + failures.length + ' of ' + ids.length +
+              ' approvals. ' + failures.slice(0, 3).join('; ') + more);
+          }
+          if (unconfirmed) messages.push('Could not confirm bulk ' + action + ' for ' + unconfirmed + ' of ' + ids.length + ' approvals.');
+        }
+      } catch (e) {
+        messages.push('Could not confirm bulk ' + action + ' for ' + ids.length + ' of ' + ids.length +
+          ' approvals. ' + e.message);
+      }
+      if (messages.length) showToast(messages.join(' '), 'error');
+      if (resolved.size && _approvalsLast?.enabled) {
+        // Reads already in flight can still include rows confirmed by this POST.
+        _approvalsAppliedFetch = _approvalsFetchSequence;
+        const items = (_approvalsLast.items || []).filter(item => !resolved.has(item.id));
+        renderApprovals({ ..._approvalsLast, items, count: items.length,
+          policy_bug_count: items.filter(item => item.policy_bug).length });
+      }
+      await fetchApprovals();
     }
 
     // Prime both panels and poll them on a modest independent interval. Do not

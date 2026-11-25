@@ -1,0 +1,1 @@
+- Show failed and unconfirmed bulk approval outcomes, keep pending items selected for retry, and scope bulk decisions to the active rule filter.

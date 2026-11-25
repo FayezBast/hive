@@ -85,6 +85,45 @@ func TestInboxSurvivesRestart(t *testing.T) {
 	}
 }
 
+func TestResolveManyKeepsPendingOnJournalWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "inbox.json")
+	inbox := NewInbox(path)
+	var ids []string
+	for n := 1; n <= 2; n++ {
+		id, err := inbox.Enqueue(pendingRequest(n), operatorVerdict())
+		if err != nil {
+			t.Fatalf("Enqueue #%d: %v", n, err)
+		}
+		ids = append(ids, id)
+	}
+
+	// Replacing a directory with the journal file forces the atomic rename to fail.
+	blocked := filepath.Join(dir, "blocked")
+	if err := os.Mkdir(blocked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inbox.path = blocked
+	results := inbox.ResolveMany(ids[:1], true, "operator", "")
+	if len(results) != 1 || results[0].ID != ids[0] || results[0].Ok || results[0].Error == "" {
+		t.Fatalf("ResolveMany with blocked journal = %+v, want a write failure for %s", results, ids[0])
+	}
+	if pending := inbox.List(); len(pending) != 2 || pending[0].ID != ids[0] || pending[1].ID != ids[1] {
+		t.Fatalf("pending list after write failure = %+v, want %v in order", pending, ids)
+	}
+	if _, ok := inbox.ResolvedRecordFor(ids[0]); ok {
+		t.Fatal("journal exposed a verdict that could not be persisted")
+	}
+
+	inbox.path = path
+	if _, err := inbox.Resolve(ids[0], false, "operator", ""); err != nil {
+		t.Fatalf("retry Resolve: %v", err)
+	}
+	if rec, ok := NewInbox(path).ResolvedRecordFor(ids[0]); !ok || rec.Approved {
+		t.Fatalf("durable verdict after retry = %+v, found=%v, want rejection", rec, ok)
+	}
+}
+
 // TestGrantedVerdictDoesNotDoubleExecute is the idempotency requirement stated
 // directly: a granted verdict re-delivered must not execute twice.
 func TestGrantedVerdictDoesNotDoubleExecute(t *testing.T) {
